@@ -148,6 +148,10 @@
         if (!['ready', 'connecting', 'working', 'offline'].includes(options.state)) throw new Error('非法 gateway 状态');
         message.state = options.state; break;
       case 'tts_start': message = { cmd, rate_khz: 16, frame_ms: 60 }; break;
+      // 手机本机朗读时同步设备"说话"状态(纯 UI 动画,无音频下行)。
+      case 'speak_state':
+        if (typeof options.on !== 'boolean') throw new Error('speak_state 需要 on 布尔值');
+        message.on = options.on; break;
       case 'set_config': message.patch = configPatch(options.patch || {}); break;
       // turn_end 是本网页任务指定的协作命令，设备必须回 EVENT 才开始处理。
       case 'turn_end': case 'turn_ready': case 'turn_cancel': case 'tts_stop': case 'tts_abort':
