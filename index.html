@@ -38,9 +38,9 @@
           <p id="compatibility" class="help"></p>
         </div>
         <div class="card pairing-card">
-          <h2>第一次连接</h2><ol><li>唤醒设备，查看屏幕上的 6 位配对码。</li><li>在手机弹出的<strong>系统蓝牙配对窗口</strong>输入同一码。</li><li>下方可输入确认已核对的码；链路就绪以设备 hello 为准。</li></ol>
-          <form id="pair-form" class="inline-form"><label class="sr-only" for="pair-code">设备屏幕的 6 位配对码</label><input id="pair-code" type="text" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" maxlength="6" placeholder="6 位配对码" required><button type="submit">已核对</button></form>
-          <p class="help">网页不能向系统提交配对码，也不会把码发给 AI 或存储。模拟设备使用 123456。</p>
+          <h2>第一次连接</h2><ol><li>唤醒设备（按任意功能键点亮屏幕）。</li><li>设备广播名形如 <strong>novus-XXXX</strong>。</li><li>点「扫描并连接」选中它即可——<strong>无需配对码、无需系统配对窗口</strong>；链路就绪以设备 hello 为准。</li></ol>
+          <form id="pair-form" class="inline-form" hidden><label class="sr-only" for="pair-code">设备屏幕的 6 位配对码</label><input id="pair-code" type="text" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" maxlength="6" placeholder="6 位配对码" required><button type="submit">已核对</button></form>
+          <p class="help">设备采用"直连即用"模式（与官方产品一致），不保存任何配对密钥。</p>
         </div>
         <details class="card"><summary>传输参数与链路诊断</summary><div class="form-grid"><label>单次 BLE 写入字节数<select id="write-size"><option value="20">20 · 保守兼容</option><option value="100">100 · 已协商较大 MTU</option><option value="244">244 · 已协商 MTU ≥ 247</option></select></label><label>写入间隔（毫秒）<input id="write-delay" type="number" min="0" max="100" value="3"></label></div><p class="help">Web Bluetooth 不提供 MTU 查询。只有确认手机与设备支持时才增大写入块；失败时改回 20。写操作串行，TTS 按 60 ms 节流。</p><pre id="diagnostics" aria-live="off">尚无帧</pre></details>
       </section>
@@ -58,7 +58,7 @@
           <div class="button-row"><button id="read-config" type="button" disabled>读取设备配置</button><button id="save-config" class="primary" type="submit" disabled>保存到设备</button></div>
           <p id="config-result" class="help" role="status">连接后读取完整配置。</p>
         </form>
-        <div class="card"><h2>重新配对</h2><p class="help">清除设备保存的手机绑定。设备会断开并重新广播；旧绑定可能还需在手机系统设置中忽略。</p><button id="reset-pairing" class="danger" disabled>清除配对</button></div>
+        <div class="card"><h2>断开与重连</h2><p class="help">让设备断开当前连接并重新广播（例如换一台手机时用）。直连模式下没有需要清理的配对密钥。</p><button id="reset-pairing" class="danger" disabled>设备断开重广播</button></div>
       </section>
       <section id="page-chat" role="tabpanel" aria-labelledby="tab-chat" hidden>
         <div class="chat-heading"><div><p class="eyebrow">此刻，想聊什么？</p><h1>我在听。</h1></div><button id="clear-chat" class="quiet">清空对话</button></div>
