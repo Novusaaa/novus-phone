@@ -44,7 +44,8 @@ CORS)。key 只存手机的 `localStorage`,永远不会下发给设备。
 | TTS | `https://api.siliconflow.cn/v1`,`FunAudioLLM/CosyVoice2-0.5B` | `/audio/speech`,`response_format: wav`,再转 16k Opus 60ms 帧下发设备 |
 
 完全不想用云端 TTS 时,把页面的「手机朗读」打开(或设备端关闭"设备朗读"):
-回复由手机本机 `speechSynthesis` 朗读,不产生任何下载流量。
+回复由手机本机 `speechSynthesis` 朗读,不产生任何下载流量。设备屏幕仍同步显示
+回复文字,形象也会同步做"说话"动画(CONTROL `speak_state`)。
 
 ## 协议测试
 
