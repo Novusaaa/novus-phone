@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f4ed">
+  <meta name="description" content="novus 随身语音助手的蓝牙配置端与 AI 网关">
+  <title>novus · 随身语音助手</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23416852'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23f6f4ed'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script defer src="protocol.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <a class="brand" href="#" aria-label="novus 首页">novus<span>随身语音助手</span></a>
+      <span id="state-badge" class="badge" data-state="offline" role="status">离线</span>
+    </header>
+    <div id="sim-banner" class="sim-banner" hidden>模拟模式 · 假 BLE 设备，不访问蓝牙硬件</div>
+    <nav class="tabs" role="tablist" aria-label="应用页面">
+      <button id="tab-connect" role="tab" aria-selected="true" aria-controls="page-connect" data-page="connect">连接</button>
+      <button id="tab-settings" role="tab" aria-selected="false" aria-controls="page-settings" tabindex="-1" data-page="settings">设置</button>
+      <button id="tab-chat" role="tab" aria-selected="false" aria-controls="page-chat" tabindex="-1" data-page="chat">对话</button>
+    </nav>
+    <main>
+      <div id="notice" class="notice" role="status" aria-live="polite">先连接 novus，再开始对话。</div>
+      <section id="page-connect" role="tabpanel" aria-labelledby="tab-connect">
+        <div class="intro"><p class="eyebrow">陪伴，从连接开始</p><h1>把声音带在身边。</h1><p>设备负责听与说，手机负责连接 AI。</p></div>
+        <div class="device-card">
+          <svg class="device-art" viewBox="0 0 170 210" aria-hidden="true"><rect x="31" y="8" width="108" height="190" rx="24" fill="#e7e3d8"/><rect x="37" y="12" width="96" height="180" rx="20" fill="#fffdf7"/><rect x="47" y="36" width="76" height="99" rx="10" fill="#dce9de"/><path d="M67 81 Q85 101 103 81" stroke="#416852" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="68" cy="67" r="3" fill="#416852"/><circle cx="101" cy="67" r="3" fill="#416852"/><circle cx="85" cy="159" r="13" fill="#e58b72"/><circle cx="54" cy="158" r="6" fill="#e7e3d8"/><circle cx="116" cy="158" r="6" fill="#e7e3d8"/><path d="M68 25h34" stroke="#d0cabe" stroke-width="3" stroke-linecap="round"/></svg>
+          <div><span id="device-name" class="device-name">等待你的 novus</span><p id="link-status">尚未连接</p><dl class="facts"><div><dt>电池</dt><dd id="battery">—</dd></div><div><dt>固件</dt><dd id="firmware">—</dd></div><div><dt>协议</dt><dd id="proto">—</dd></div></dl></div>
+        </div>
+        <div class="card">
+          <label for="name-prefix">名称前缀 <span class="muted">可选，与服务 UUID 同时过滤</span></label>
+          <input id="name-prefix" type="text" placeholder="novus-（留空扫描全部 NUS 设备）" maxlength="40">
+          <div class="button-row"><button id="connect" class="primary">扫描并连接</button><button id="reconnect" disabled>重新连接</button><button id="disconnect" disabled>断开</button></div>
+          <p id="compatibility" class="help"></p>
+        </div>
+        <div class="card pairing-card">
+          <h2>第一次连接</h2><ol><li>唤醒设备，查看屏幕上的 6 位配对码。</li><li>在手机弹出的<strong>系统蓝牙配对窗口</strong>输入同一码。</li><li>下方可输入确认已核对的码；链路就绪以设备 hello 为准。</li></ol>
+          <form id="pair-form" class="inline-form"><label class="sr-only" for="pair-code">设备屏幕的 6 位配对码</label><input id="pair-code" type="text" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" maxlength="6" placeholder="6 位配对码" required><button type="submit">已核对</button></form>
+          <p class="help">网页不能向系统提交配对码，也不会把码发给 AI 或存储。模拟设备使用 123456。</p>
+        </div>
+        <details class="card"><summary>传输参数与链路诊断</summary><div class="form-grid"><label>单次 BLE 写入字节数<select id="write-size"><option value="20">20 · 保守兼容</option><option value="100">100 · 已协商较大 MTU</option><option value="244">244 · 已协商 MTU ≥ 247</option></select></label><label>写入间隔（毫秒）<input id="write-delay" type="number" min="0" max="100" value="3"></label></div><p class="help">Web Bluetooth 不提供 MTU 查询。只有确认手机与设备支持时才增大写入块；失败时改回 20。写操作串行，TTS 按 60 ms 节流。</p><pre id="diagnostics" aria-live="off">尚无帧</pre></details>
+      </section>
+      <section id="page-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <div class="intro"><p class="eyebrow">适合你的节奏</p><h1>小设备，也有主张。</h1><p>配置由设备持久化，收到确认后才算保存成功。</p></div>
+        <form id="device-config" class="card">
+          <fieldset id="config-fields" disabled>
+            <label class="slider-label" for="vol">音量 <output id="vol-value">80</output></label><input id="vol" type="range" min="0" max="100" value="80">
+            <label class="slider-label" for="bright">屏幕亮度 <output id="bright-value">100</output></label><input id="bright" type="range" min="0" max="100" value="100">
+            <label class="slider-label" for="mic_db">麦克风增益（dB） <output id="mic_db-value">30</output></label><input id="mic_db" type="range" min="0" max="32" step="4" value="30">
+            <label for="screen_to">自动熄屏（秒）</label><input id="screen_to" type="number" min="15" max="300" step="1" value="60" required>
+            <label class="switch-row"><span>设备朗读回复<small>关闭时由手机本机朗读</small></span><input id="speak" type="checkbox" checked></label>
+            <label class="switch-row"><span>角色动画<small>让 novus 的状态可见</small></span><input id="anim" type="checkbox" checked></label>
+          </fieldset>
+          <div class="button-row"><button id="read-config" type="button" disabled>读取设备配置</button><button id="save-config" class="primary" type="submit" disabled>保存到设备</button></div>
+          <p id="config-result" class="help" role="status">连接后读取完整配置。</p>
+        </form>
+        <div class="card"><h2>重新配对</h2><p class="help">清除设备保存的手机绑定。设备会断开并重新广播；旧绑定可能还需在手机系统设置中忽略。</p><button id="reset-pairing" class="danger" disabled>清除配对</button></div>
+      </section>
+      <section id="page-chat" role="tabpanel" aria-labelledby="tab-chat" hidden>
+        <div class="chat-heading"><div><p class="eyebrow">此刻，想聊什么？</p><h1>我在听。</h1></div><button id="clear-chat" class="quiet">清空对话</button></div>
+        <div id="history" class="history" role="log" aria-live="polite" aria-label="对话历史"><p class="empty">一段想法，一个问题。<br>按住按钮，对着 novus 说话。</p></div>
+        <div class="talk-area"><button id="talk" class="talk-button" disabled><span class="talk-icon" aria-hidden="true">◉</span><span id="talk-label">按住说话</span></button><p id="talk-hint" class="help">也可按住设备 OK 键；设备发出结束事件后才提交。</p><button id="cancel-turn" class="quiet">取消当前对话 / 停止朗读</button></div>
+        <form id="text-form" class="composer"><label class="sr-only" for="question">直接输入问题</label><textarea id="question" rows="2" maxlength="12000" placeholder="也可以打字问我……" required></textarea><button id="send-text" class="primary" type="submit">发送</button></form>
+        <label class="switch-row phone-speech"><span>手机朗读<small>使用手机本机语音，跳过 TTS provider 与下行</small></span><input id="phone-speech" type="checkbox"></label>
+        <details class="card" id="provider-details"><summary>AI 服务设置 <span class="muted">ASR · LLM · TTS</span></summary><form id="provider-form"><div id="providers"></div><label>系统提示词<textarea id="system-prompt" rows="3" maxlength="2000">你是 novus，一位简洁、温暖的随身语音助手。默认使用中文回答。</textarea></label><div class="button-row"><button class="primary" type="submit">保存服务设置</button><button id="forget-keys" type="button">删除已存密钥</button></div><p class="help">密钥仅保存到当前浏览器 localStorage。请求直接发送到填写的端点；不发送到设备。请在自己的手机上使用。</p><p id="provider-result" role="status" class="help"></p></form></details>
+        <div id="sim-controls" class="card" hidden><h2>模拟联调台</h2><label class="switch-row"><span>演示 provider<small>固定回复，不联网、不需要密钥</small></span><input id="sim-providers" type="checkbox" checked></label><label class="switch-row"><span>注入假 ASR 文本<small>关闭后，合成音 WAV 会提交给真实 ASR</small></span><input id="sim-asr" type="checkbox" checked></label><label>假 ASR 文本<input id="sim-text" type="text" value="你好，请介绍一下你自己。" maxlength="2000"></label><div class="button-row"><button id="sim-inject">注入 1 秒上行音频</button></div><p class="help">合成音为 16 kHz 单声道正弦波，经过真实 PCM 协议帧与 WAV 封装。关闭演示 provider 可联调真实服务。无 WebCodecs 时模拟 TTS 仅验证控制与包头，不代表真实 Opus 编解码。</p><details><summary>模拟设备屏幕（TEXT U / A / S）</summary><pre id="sim-screen">等待文本</pre></details></div>
+      </section>
+    </main>
+    <footer>novus <span>声音在身边，世界在手机里。</span></footer>
+  </div>
+</body>
+</html>
