@@ -736,11 +736,14 @@
   }
   async function deviceSpeak(packets, task) {
     const signal = task.controller.signal;
-    // 整轮只预缓冲三包，后续句子延续同一 SEQ；逐 ATT chunk await 保留链路背压。
+    // 整轮预缓冲 16 包(约 1 秒)再转入实时节奏:BLE 抖动常达数百毫秒,3 包的浅缓冲
+    // 会让设备端反复饿等(真机"说话卡"主因之一)。设备队列容量 24,16 包留有 8 包余量。
+    // 后续句子延续同一 SEQ;逐 ATT chunk await 保留链路背压。
+    const PREBUFFER_FRAMES = 16;
     for (const packet of packets) {
       current(task); const started = performance.now();
       await sendFrames([P.ttsFrame(task.ttsSeq++ & 255, packet)], signal);
-      if (++task.ttsFrames >= 3) await sleep(Math.max(0, FRAME_MS - (performance.now() - started)), signal);
+      if (++task.ttsFrames >= PREBUFFER_FRAMES) await sleep(Math.max(0, FRAME_MS - (performance.now() - started)), signal);
     }
   }
   async function finishDeviceSpeech(task) {
