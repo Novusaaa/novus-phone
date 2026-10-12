@@ -339,7 +339,8 @@
   async function sendText(role, text, signal) {
     if (!online) return;
     // 设备 TEXT 上限包括 role；保留完整手机历史，仅截断设备显示。
-    let shown = text;
+    let shown = role === 'A' ? P.cleanForDevice(text) : text;
+    if (!shown) return;
     if (new TextEncoder().encode(shown).length > 2047) {
       const chars = Array.from(shown); let count = 0; shown = '';
       for (const char of chars) { const size = new TextEncoder().encode(char).length; if (count + size > 2044) break; shown += char; count += size; }
@@ -617,7 +618,7 @@
     return answer.trim() + (answer.length >= ANSWER_CHAR_CAP ? '…' : '');
   }
   async function ask(text, task = newJob('text')) {
-    const signal = task.controller.signal, splitter = new P.SentenceSplitter();
+    const signal = task.controller.signal, splitter = new P.ReplySplitter();
     const phone = $('phone-speech').checked || config?.speak === false || !online;
     let speechTail = Promise.resolve(), speechError = null, body = null, shown = '';
     // 所有后台 Promise 都立即挂拒绝处理；语音/写入失败同时取消 LLM 与其余句子。
@@ -627,6 +628,8 @@
     };
     const enqueue = sentence => {
       current(task);
+      // 空代码块、图片或纯表情不产生设备文字，也不启动任何朗读。
+      if (!P.cleanForDevice(sentence)) return;
       const displayed = monitor(sendText('A', sentence, signal));
       let prepared;
       if (!phone) {
@@ -654,6 +657,7 @@
       current(task); for (const sentence of splitter.flush()) enqueue(sentence);
       history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
       if (history.length > 40) history.splice(0, history.length - 40);
+      if (!P.cleanForDevice(answer)) await sendText('S', '（回复为代码或图片，请在手机查看）', signal);
       await speechTail; current(task);
       if (task.ttsStarted) await finishDeviceSpeech(task);
       current(task); job = null; await gateway('ready'); notice('这一轮已完成。', 'success');
@@ -708,6 +712,8 @@
   }
   async function prepareDeviceSpeech(text, task) {
     const signal = task.controller.signal;
+    text = P.cleanForSpeech(text);
+    if (!text) return [];
     let wav;
     if (SIM && $('sim-providers').checked) wav = wavEncode(syntheticTone(1));
     else wav = await fetchProvider('tts', '/audio/speech', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.tts.model, input: text, voice: providers.tts.voice, response_format: 'wav' }) }, signal);
@@ -749,6 +755,8 @@
     finally { task.playing = false; }
   }
   async function phoneSpeak(text, task) {
+    text = P.cleanForSpeech(text);
+    if (!text) return;
     current(task); state('speaking');
     if (!('speechSynthesis' in window)) { addMessage('S', '手机浏览器不支持本机朗读，回复已显示为文字。'); return; }
     const signal = task.controller.signal;
