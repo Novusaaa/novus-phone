@@ -5,9 +5,9 @@
   else root.NovProtocol = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
-  const TYPE = Object.freeze({ AUDIO_PCM: 1, TEXT: 2, CONTROL: 3, EVENT: 4, AUDIO_OPUS: 5, TTS_OPUS: 6 });
+  const TYPE = Object.freeze({ AUDIO_PCM: 1, TEXT: 2, CONTROL: 3, EVENT: 4, AUDIO_OPUS: 5, TTS_OPUS: 6, TTS_PCM: 7 });
   const FLAG = Object.freeze({ MORE: 1, FIRST: 2, LAST: 4 });
-  const LIMIT = Object.freeze({ 1: 1024, 2: 2048, 3: 512, 4: 512, 5: 512, 6: 512 });
+  const LIMIT = Object.freeze({ 1: 1024, 2: 2048, 3: 512, 4: 512, 5: 512, 6: 512, 7: 515 }); // 7: 3B 包头 + 512B PCM
   const encoder = new TextEncoder();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   const validFlags = new Set([0, 1, 3, 4, 6]);
@@ -127,12 +127,16 @@
   function configPatch(patch) {
     const out = {};
     const ranges = { vol: [0, 100], bright: [0, 100], mic_db: [0, 32], screen_to: [15, 300] };
+    const strings = { wifi_ssid: 32, wifi_pass: 64 }; // 长度上限与设备 nov_types.h 一致
     for (const [key, value] of Object.entries(patch)) {
       if (ranges[key]) {
         const [lo, hi] = ranges[key];
         if (!Number.isInteger(value) || value < lo || value > hi) throw new RangeError('配置范围错误：' + key);
       } else if (key === 'speak' || key === 'anim') {
         if (typeof value !== 'boolean') throw new TypeError('配置必须是布尔值：' + key);
+      } else if (strings[key]) {
+        if (typeof value !== 'string' || new TextEncoder().encode(value).length > strings[key])
+          throw new TypeError('配置字符串非法或超长：' + key);
       } else throw new Error('未知配置项：' + key);
       out[key] = value;
     }
@@ -147,7 +151,11 @@
       case 'gateway':
         if (!['ready', 'connecting', 'working', 'offline'].includes(options.state)) throw new Error('非法 gateway 状态');
         message.state = options.state; break;
-      case 'tts_start': message = { cmd, rate_khz: 16, frame_ms: 60 }; break;
+      case 'tts_start':
+        // PCM(设备自伺服/WiFi 链路):16ms 帧,网页无需 WebCodecs。
+        message = options.pcm ? { cmd, rate_khz: 16, frame_ms: 16, codec: 'pcm' }
+                              : { cmd, rate_khz: 16, frame_ms: 60 };
+        break;
       // 手机本机朗读时同步设备"说话"状态(纯 UI 动画,无音频下行)。
       case 'speak_state':
         if (typeof options.on !== 'boolean') throw new Error('speak_state 需要 on 布尔值');
@@ -173,6 +181,12 @@
   function ttsFrame(seq, packet) {
     if (!Number.isInteger(seq) || seq < 0 || seq > 255 || !bytes(packet).length) throw new Error('非法 TTS 音频');
     return encodeFrame(TYPE.TTS_OPUS, concat([Uint8Array.of(seq, 16, 60), bytes(packet)]));
+  }
+  // PCM 下行帧(设备自伺服链路):[SEQ][rate_khz=16][frame_ms=16][int16LE],≤512B。
+  function ttsPcmFrame(seq, packet) {
+    const data = bytes(packet);
+    if (!Number.isInteger(seq) || seq < 0 || seq > 255 || !data.length || data.length % 2 || data.length > 512) throw new Error('非法 TTS PCM 音频');
+    return encodeFrame(TYPE.TTS_PCM, concat([Uint8Array.of(seq, 16, 16), data]));
   }
   // RFC 6716 的 TOC：验证浏览器实际产出的帧长，不能仅信任配置回报。
   function opusDuration(packet) {
@@ -306,6 +320,6 @@
     }
   }
   return { TYPE, FLAG, LIMIT, bytes, concat, encodeFrame, fragment, FrameParser, MessageAssembler,
-    jsonPayload, parseJSON, control, configPatch, textPayload, parseText, textFrames, ttsFrame, opusDuration,
+    jsonPayload, parseJSON, control, configPatch, textPayload, parseText, textFrames, ttsFrame, ttsPcmFrame, opusDuration,
     SSEParser, SentenceSplitter, ReplySplitter, REPLY_CHAR_LIMIT, cleanForDevice, cleanForSpeech };
 });
