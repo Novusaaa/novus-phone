@@ -96,7 +96,7 @@
     for (let i = 0; i < data.length; i++) data[i] = Math.sin(2 * Math.PI * 440 * i / RATE) * 0.12 * Math.min(1, i / 160, (data.length - i) / 160);
     return data;
   }
-  async function readLLMStream(response, signal, emit) {
+  async function readLLMStream(response, signal, emit, shouldStop) {
     check(signal);
     if (!/^text\/event-stream\b/i.test(response.headers.get('Content-Type') || '') || !response.body?.getReader) {
       await response.body?.cancel().catch(() => {});
@@ -105,14 +105,20 @@
     const reader = response.body.getReader(), decoder = new TextDecoder(), sse = new P.SSEParser();
     const stop = () => { reader.cancel().catch(() => {}); };
     check(signal); signal?.addEventListener('abort', stop, { once: true });
+    let capped = false;
     try {
       while (!sse.done) {
         const { value, done } = await reader.read(); check(signal);
-        for (const delta of sse.push(decoder.decode(value, { stream: !done }))) emit(delta);
+        for (const delta of sse.push(decoder.decode(value, { stream: !done }))) {
+          emit(delta);
+          // 输出硬上限:到达即主动收流,不算"中断"(用户要求限制输出,防长回复拖慢链路)。
+          if (shouldStop && shouldStop()) { capped = true; break; }
+        }
+        if (capped) break;
         if (done) { for (const delta of sse.flush()) emit(delta); break; }
       }
       // 缺少任何正常结束标记的 EOF 是中断，不能把半截回答当作成功。
-      if (!sse.done && !sse.finished) throw new Error('LLM 流式响应中断，请重试。');
+      if (!capped && !sse.done && !sse.finished) throw new Error('LLM 流式响应中断，请重试。');
     } finally {
       signal?.removeEventListener('abort', stop);
       await reader.cancel().catch(() => {}); reader.releaseLock();
@@ -581,8 +587,11 @@
     }
     messages.push(...recent, { role: 'user', content: text });
     let answer = '';
+    // 硬上限:回复最长 ANSWER_CHAR_CAP 字(设备对讲链路,长回复=长等待+长播放,必须限)。
+    const ANSWER_CHAR_CAP = 160;
     const emit = delta => { check(signal); answer += delta; onDelta(delta); };
-    const consume = (response, requestSignal) => readLLMStream(response, requestSignal, emit);
+    const consume = (response, requestSignal) =>
+      readLLMStream(response, requestSignal, emit, () => answer.length >= ANSWER_CHAR_CAP);
     const request = async stream => {
       if (SIM && $('sim-providers').checked) {
         await sleep(350, signal);
@@ -590,19 +599,22 @@
         // 假 provider 返回整段 JSON，实际经过同一条非 SSE 回退路径。
         return stream ? consume(new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } }), signal) : result;
       }
-      return fetchProvider('llm', '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.llm.model, messages, stream, max_tokens: 1024 }) }, signal, stream ? consume : undefined);
+      return fetchProvider('llm', '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.llm.model, messages, stream, max_tokens: 256 }) }, signal, stream ? consume : undefined);
     };
     try { await request(true); }
     catch (error) {
       // 仅在尚未开始 SSE 的 HTTP/格式拒绝时重试；中途失败绝不重播半截答案。
       if (!error.streamUnsupported) throw error;
       check(signal); diagnostic('LLM 不支持流式，已回退整段请求');
-      const result = await request(false), content = result.choices?.[0]?.message?.content;
+      const result = await request(false);
+      let content = result.choices?.[0]?.message?.content;
       if (typeof content !== 'string') throw new Error('LLM 响应没有有效的 choices[0].message.content');
+      if (content.length > ANSWER_CHAR_CAP) content = content.slice(0, ANSWER_CHAR_CAP); // 非流式同样截断
       emit(content);
     }
     if (!answer.trim()) throw new Error('LLM 响应没有有效的回答内容');
-    return answer.trim();
+    if (answer.length >= ANSWER_CHAR_CAP) onDelta('…'); // 显式省略号,不静默截断
+    return answer.trim() + (answer.length >= ANSWER_CHAR_CAP ? '…' : '');
   }
   async function ask(text, task = newJob('text')) {
     const signal = task.controller.signal, splitter = new P.SentenceSplitter();
