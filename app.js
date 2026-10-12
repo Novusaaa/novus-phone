@@ -6,7 +6,7 @@
   // CosyVoice2 预置音色(硅基流动):官方要求 voice 带模型前缀;也支持"音色复刻"返回的 uri。
   const TTS_VOICE_PREFIX = 'FunAudioLLM/CosyVoice2-0.5B:';
   const TTS_VOICES = [['alex', '沉稳男声'], ['benjamin', '低沉男声'], ['charles', '磁性男声'], ['david', '欢快男声'], ['anna', '沉稳女声'], ['bella', '激情女声'], ['claire', '温柔女声'], ['diana', '欢快女声']];
-  const DEFAULT_CONFIG = { vol: 80, bright: 100, mic_db: 30, screen_to: 60, speak: true, anim: true };
+  const DEFAULT_CONFIG = { vol: 80, bright: 100, mic_db: 30, screen_to: 60, speak: true, anim: true, wifi_ssid: '' };
   const DEFAULT_PROVIDERS = {
     asr: { base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', key: '' },
     llm: { base: 'https://api.deepseek.com', model: 'deepseek-chat', key: '' },
@@ -130,6 +130,14 @@
 
   const $ = id => document.getElementById(id);
   const SIM = new URLSearchParams(location.search).get('sim') === '1';
+  // PCM 下行常量(设备自伺服/WiFi 链路):512B = 256 样本 @16k = 16ms。
+  const PCM_FRAME_SAMPLES = 256, PCM_FRAME_MS = 16;
+  // 设备自伺服模式:页面由 novus 设备(局域网 IP)通过 HTTP 提供,走 WebSocket 帧传输。
+  // 无需 Web Bluetooth(iPhone Safari 可用);本地开发服务器(localhost)不算。
+  // ?device=1 可强制(本地联调/反向代理场景);默认按"http + 非本机"识别设备页。
+  const DEVICE = new URLSearchParams(location.search).get('device') === '1' ||
+    (!SIM && location.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname));
+  const PCM_TTS = DEVICE; // 网页链路:下行用 PCM(免 WebCodecs,局域网带宽充裕)
   const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
   const RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e', TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
   const STORAGE = 'novus-phone.providers.v1';
@@ -157,7 +165,7 @@
     $('save-config').disabled = !online || !config;
     $('reset-pairing').disabled = !online;
     $('config-fields').disabled = !online || !config;
-    $('talk').disabled = !online || (!SIM && !decoderAvailable() && !link?.caps?.includes('pcm'));
+    $('talk').disabled = DEVICE || !online || (!SIM && !decoderAvailable() && !link?.caps?.includes('pcm'));
   }
   function addMessage(role, text) {
     if (!text) return;
@@ -281,6 +289,43 @@
       this.device.removeEventListener('gattserverdisconnected', this.onDisconnect);
     }
   }
+  // 设备自伺服模式:与同源(http://<设备IP>)的 WebSocket 端点交换协议帧。
+  // 帧格式与 BLE 完全一致;每条消息 = 一帧(设备侧重组器也容忍跨消息分片)。
+  class WebSocketLink {
+    constructor() {
+      this.device = { name: 'novus · WiFi 直连' };
+      this.connected = false; this.caps = []; this.ws = null;
+      this.onMessage = event => receive(new Uint8Array(event.data).slice());
+      this.onClose = () => {
+        const wasConnected = this.connected;
+        this.connected = false; this.ws = null;
+        if (wasConnected) disconnected();
+      };
+    }
+    async connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+      this.ws = ws;
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { try { ws.close(); } catch { /* 已关闭 */ } reject(new Error('连接设备超时。请确认设备在同一热点下且屏幕显示本页地址。')); }, 8000);
+        ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+        ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('WebSocket 连接失败，请刷新页面重试。')); }, { once: true });
+        ws.addEventListener('close', () => { clearTimeout(timer); reject(new Error('连接被设备关闭，请刷新页面重试。')); }, { once: true });
+      });
+      this.connected = true;
+      ws.addEventListener('message', this.onMessage);
+      ws.addEventListener('close', this.onClose);
+    }
+    async write(chunk) {
+      if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('网页链路不可写，请刷新页面重连。');
+      this.ws.send(chunk);
+    }
+    disconnect() { try { this.ws?.close(); } catch { /* 已关闭 */ } }
+    dispose() {
+      this.ws?.removeEventListener('message', this.onMessage);
+      this.ws?.removeEventListener('close', this.onClose);
+    }
+  }
   class SimLink {
     constructor() { this.connected = false; this.device = { name: 'novus-sim' }; this.caps = ['opus', 'pcm', 'cfg']; this.config = { ...DEFAULT_CONFIG }; this.inParser = new P.FrameParser(); this.inAssembler = new P.MessageAssembler(); this.turn = null; this.tts = 0; this.timers = new Set(); }
     later(fn, ms) { const timer = setTimeout(() => { this.timers.delete(timer); if (this.connected) fn(); }, ms); this.timers.add(timer); }
@@ -337,8 +382,11 @@
     check(signal);
     if (!online || !link?.connected) throw new Error('设备尚未就绪');
     const target = link, version = session;
-    const writeSize = Number($('write-size').value), delay = Number($('write-delay').value);
-    if (![20, 100, 244].includes(writeSize) || !Number.isFinite(delay) || delay < 0 || delay > 100) throw new Error('传输参数不合法');
+    // WebSocket 是整帧消息传输:不按 BLE ATT 块切分,也没有块间延时(切分反而拖慢)。
+    const whole = target instanceof WebSocketLink;
+    const writeSize = whole ? Infinity : Number($('write-size').value);
+    const delay = whole ? 0 : Number($('write-delay').value);
+    if (!whole && (![20, 100, 244].includes(writeSize) || !Number.isFinite(delay) || delay < 0 || delay > 100)) throw new Error('传输参数不合法');
     const operation = txTail.catch(() => {}).then(async () => {
       for (const frame of frames) {
         for (let i = 0; i < frame.length; i += writeSize) {
@@ -372,12 +420,14 @@
   }
   async function connect(reuse) {
     if (connecting || online) return;
-    if (!SIM && (!window.isSecureContext || !navigator.bluetooth)) throw new Error('当前浏览器不能使用 Web Bluetooth。请使用安全上下文中的安卓 Chrome / Edge；iOS 可尝试 Bluefy，或使用 ?sim=1 联调。');
-    connecting = true; controls(); state('connecting'); notice('选择设备；如系统弹出配对窗口，请输入设备屏幕上的 6 位码。');
+    if (!SIM && !DEVICE && (!window.isSecureContext || !navigator.bluetooth)) throw new Error('当前浏览器不能使用 Web Bluetooth。请使用安全上下文中的安卓 Chrome / Edge；iOS 可尝试 Bluefy，或使用 ?sim=1 联调。');
+    connecting = true; controls(); state('connecting');
+    notice(DEVICE ? '正在连接设备网页…' : '选择设备；如系统弹出配对窗口，请输入设备屏幕上的 6 位码。');
     try {
       if (!reuse || !link) {
         const old = link;
         if (SIM) link = new SimLink();
+        else if (DEVICE) link = new WebSocketLink();
         else {
           const prefix = $('name-prefix').value.trim();
           const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE], ...(prefix ? { namePrefix: prefix } : {}) }], optionalServices: [SERVICE] });
@@ -405,7 +455,7 @@
       if (event.proto !== 1) { rejectWaiters(new Error('不兼容的协议版本：' + event.proto)); link?.disconnect(); return; }
       online = true; link.caps = Array.isArray(event.caps) ? event.caps : [];
       $('device-name').textContent = link.device.name || event.model || 'novus';
-      $('link-status').textContent = '已加密并订阅 · 网关就绪';
+      $('link-status').textContent = DEVICE ? 'WiFi 直连 · 网关就绪' : '已加密并订阅 · 网关就绪';
       $('battery').textContent = typeof event.battery === 'number' && event.battery >= 0 && event.battery <= 100 ? event.battery + '%' : '未知';
       $('firmware').textContent = String(event.fw || '未知'); $('proto').textContent = 'v' + event.proto;
       state('ready'); controls(); diagnostic('收到 hello，链路就绪');
@@ -415,9 +465,14 @@
         const values = Object.fromEntries(Object.keys(DEFAULT_CONFIG).map(key => [key, event[key]]));
         config = P.configPatch(values);
         for (const [key, value] of Object.entries(config)) {
-          if (typeof value === 'boolean') $(key).checked = value;
-          else { $(key).value = value; if ($(key + '-value')) $(key + '-value').textContent = value; }
+          // wifi_ssid 的输入框 id 用连字符(wifi-ssid),其余键名与 id 同名。
+          const id = key === 'wifi_ssid' ? 'wifi-ssid' : key;
+          if (typeof value === 'boolean') $(id).checked = value;
+          else { $(id).value = value; if ($(id + '-value')) $(id + '-value').textContent = value; }
         }
+        // 口令不回传：以占位符提示是否已设置，输入框始终留空。
+        $('wifi-pass').value = '';
+        $('wifi-pass').placeholder = event.wifi_pass_set === true ? '已设置（留空不修改）' : '开放网络可留空';
         controls();
       } catch (error) { rejectWaiters(error); fail(error); return; }
     } else if (event.ev === 'turn_start') {
@@ -592,7 +647,7 @@
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', stop); }
   }
   async function transcribe(wav, signal) {
-    if (SIM && ($('sim-asr').checked || $('sim-providers').checked)) { await sleep(180, signal); return $('sim-text').value; }
+    if ((SIM || DEVICE) && ($('sim-asr').checked || $('sim-providers').checked)) { await sleep(180, signal); return $('sim-text').value; }
     const form = new FormData(); form.append('file', new Blob([wav], { type: 'audio/wav' }), 'novus.wav'); form.append('model', providers.asr.model);
     const result = await fetchProvider('asr', '/audio/transcriptions', { method: 'POST', body: form }, signal);
     if (typeof result.text !== 'string') throw new Error('ASR 响应缺少 text 字段');
@@ -616,7 +671,7 @@
     const consume = (response, requestSignal) =>
       readLLMStream(response, requestSignal, emit, () => answer.length >= ANSWER_CHAR_CAP);
     const request = async stream => {
-      if (SIM && $('sim-providers').checked) {
+      if ((SIM || DEVICE) && $('sim-providers').checked) {
         await sleep(350, signal);
         const result = { choices: [{ message: { content: '你好，我是 novus。你可以按住说话，也可以直接打字。手机帮我连接 AI，我把回应带回你身边。' } }] };
         // 假 provider 返回整段 JSON，实际经过同一条非 SSE 回退路径。
@@ -657,7 +712,7 @@
       if (!phone) {
         if (!task.ttsStarted) {
           task.ttsSeq = 0; task.ttsFrames = 0; task.playing = true; state('speaking');
-          task.ttsStarted = monitor(sendControl('tts_start', {}, signal));
+          task.ttsStarted = monitor(sendControl('tts_start', { pcm: PCM_TTS }, signal));
         }
         // 合成与 LLM 读取并行；每句立即请求 TTS，发送仍按句子顺序串行。
         prepared = monitor(prepareDeviceSpeech(sentence, task));
@@ -750,10 +805,21 @@
     text = P.cleanForSpeech(text);
     if (!text) return [];
     let wav;
-    if (SIM && $('sim-providers').checked) wav = wavEncode(syntheticTone(1));
+    if ((SIM || DEVICE) && $('sim-providers').checked) wav = wavEncode(syntheticTone(1));
     else wav = await fetchProvider('tts', '/audio/speech', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.tts.model, input: text, voice: providers.tts.voice, response_format: 'wav' }) }, signal);
     current(task); const decoded = wavDecode(wav), pcm = await toMono16k(decoded.samples, decoded.rate, signal);
     if (!pcm.length) throw new Error('TTS 返回了空音频');
+    if (PCM_TTS) {
+      // WiFi 直连:下行直接发 16bit PCM 小帧(局域网带宽充裕),手机无需 WebCodecs。
+      const packets = [];
+      for (let offset = 0; offset < pcm.length; offset += PCM_FRAME_SAMPLES) {
+        const slice = pcm.subarray(offset, offset + PCM_FRAME_SAMPLES);
+        const bytes = new Uint8Array(slice.length * 2); const view = new DataView(bytes.buffer);
+        for (let i = 0; i < slice.length; i++) view.setInt16(i * 2, Math.max(-1, Math.min(1, slice[i])) * 32767, true);
+        packets.push(bytes);
+      }
+      current(task); return packets;
+    }
     let packets;
     if (SIM && !encoderAvailable()) {
       // 仅给假链路用的占位包；永不下发到真实设备。
@@ -771,20 +837,22 @@
   }
   async function deviceSpeak(packets, task) {
     const signal = task.controller.signal;
-    // 整轮预缓冲 16 包(约 1 秒)再转入实时节奏:BLE 抖动常达数百毫秒,3 包的浅缓冲
-    // 会让设备端反复饿等(真机"说话卡"主因之一)。设备队列容量 24,16 包留有 8 包余量。
-    // 后续句子延续同一 SEQ;逐 ATT chunk await 保留链路背压。
-    const PREBUFFER_FRAMES = 16;
+    // 整轮预缓冲再转入实时节奏:BLE 抖动大(16 包≈1s);WiFi 链路帧更短,32 帧≈0.5s 足够。
+    // 设备队列容量 24,预缓冲留有数包余量。后续句子延续同一 SEQ。
+    const frameMs = PCM_TTS ? PCM_FRAME_MS : FRAME_MS;
+    const PREBUFFER_FRAMES = PCM_TTS ? 32 : 16;
     for (const packet of packets) {
       current(task); const started = performance.now();
-      await sendFrames([P.ttsFrame(task.ttsSeq++ & 255, packet)], signal);
-      if (++task.ttsFrames >= PREBUFFER_FRAMES) await sleep(Math.max(0, FRAME_MS - (performance.now() - started)), signal);
+      const frame = PCM_TTS ? P.ttsPcmFrame(task.ttsSeq & 255, packet) : P.ttsFrame(task.ttsSeq & 255, packet);
+      task.ttsSeq++;
+      await sendFrames([frame], signal);
+      if (++task.ttsFrames >= PREBUFFER_FRAMES) await sleep(Math.max(0, frameMs - (performance.now() - started)), signal);
     }
   }
   async function finishDeviceSpeech(task) {
     const signal = task.controller.signal;
     // LLM 与句子队列都已结束才等播放确认，避免把生成时间算入确认超时。
-    const played = awaitEvent(e => e.ev === 'tts_playback_done', task.ttsFrames * FRAME_MS + 30000, signal);
+    const played = awaitEvent(e => e.ev === 'tts_playback_done', task.ttsFrames * (PCM_TTS ? PCM_FRAME_MS : FRAME_MS) + 30000, signal);
     try {
       await sendControl('tts_stop', {}, signal);
       const event = await played.promise; current(task);
@@ -808,7 +876,7 @@
     });
   }
   async function holdStart() {
-    if (holding || !online) return;
+    if (holding || !online || DEVICE) return; // 设备自伺服模式:请在设备上按 OK(本页麦克风在局域网 HTTP 下不可用)
     // 编码器预检不需要麦克风权限，声音始终来自设备。
     const codec = await chooseCodec(); if (!online || holding) return;
     if (job) await cancelTurn();
@@ -862,8 +930,12 @@
   $('device-config').addEventListener('submit', event => {
     event.preventDefault();
     run(() => {
-      const patch = P.configPatch({ vol: Number($('vol').value), bright: Number($('bright').value), mic_db: Number($('mic_db').value), screen_to: Number($('screen_to').value), speak: $('speak').checked, anim: $('anim').checked });
-      return configOperation('set_config', patch);
+      const patch = { vol: Number($('vol').value), bright: Number($('bright').value), mic_db: Number($('mic_db').value), screen_to: Number($('screen_to').value), speak: $('speak').checked, anim: $('anim').checked };
+      // WiFi 凭据可选:SSID 留空 = 不改动;口令留空 = 不改动(避免每次保存清掉)。
+      const ssid = $('wifi-ssid').value.trim(), pass = $('wifi-pass').value;
+      if (ssid) patch.wifi_ssid = ssid;
+      if (pass) patch.wifi_pass = pass;
+      return configOperation('set_config', P.configPatch(patch));
     });
   });
   $('reset-pairing').addEventListener('click', () => run(resetPairing));
@@ -981,17 +1053,28 @@
     localStorage.removeItem(STORAGE); for (const kind of Object.keys(providers)) { providers[kind].key = ''; $(kind + '-key').value = ''; }
     $('provider-result').textContent = '已删除本地服务设置和密钥。'; notice('已删除本地密钥。', 'success');
   }));
-  $('sim-banner').hidden = !SIM; $('sim-controls').hidden = !SIM;
+  $('sim-banner').hidden = !SIM; $('sim-controls').hidden = !(SIM || DEVICE);
   $('sim-inject').addEventListener('click', () => run(async () => {
     if (!online) await connect(false);
     showPage('chat'); await holdStart(); await sleep(1000); await holdEnd();
   }));
   const tips = [];
-  if (SIM) tips.push('当前为模拟链路，点击连接即可使用；模拟模式从不调用 navigator.bluetooth。');
-  else if (!navigator.bluetooth) tips.push('此浏览器无 Web Bluetooth。iOS Safari 不支持；可尝试 Bluefy（仍需检查 WebCodecs），或使用安卓 Chrome / Edge。');
-  else tips.push('安卓 Chrome / Edge 或桌面 Chrome；保持网页在前台。');
-  if (!window.isSecureContext && !SIM) tips.push('当前页面不是安全上下文。手机需要可信 HTTPS；电脑可用 localhost。局域网 HTTP 无法访问蓝牙。');
-  if (!decoderAvailable() || !encoderAvailable()) tips.push('缺少 WebCodecs 音频支持：可输入文字、选择手机朗读；设备支持 PCM 时可降级上行。模拟模式不阻塞。');
+  if (DEVICE) {
+    // 本页由设备伺服:WiFi 直连模式,不涉及 Web Bluetooth。
+    const prefix = $('name-prefix'), prefixLabel = prefix?.previousElementSibling;
+    if (prefix) prefix.hidden = true;
+    if (prefixLabel) prefixLabel.hidden = true;
+    const pairing = document.querySelector('.pairing-card'); if (pairing) pairing.hidden = true;
+    $('connect').textContent = '连接设备';
+    tips.push('WiFi 直连模式：页面由设备提供，音频不走蓝牙。');
+  } else {
+    if (SIM) tips.push('当前为模拟链路，点击连接即可使用；模拟模式从不调用 navigator.bluetooth。');
+    else if (!navigator.bluetooth) tips.push('此浏览器无 Web Bluetooth。iOS Safari 不支持；可尝试 Bluefy（仍需检查 WebCodecs），或使用安卓 Chrome / Edge。');
+    else tips.push('安卓 Chrome / Edge 或桌面 Chrome；保持网页在前台。');
+    if (!window.isSecureContext && !SIM) tips.push('当前页面不是安全上下文。手机需要可信 HTTPS；电脑可用 localhost。局域网 HTTP 无法访问蓝牙。');
+  }
+  if (!SIM && (!decoderAvailable() || !encoderAvailable())) tips.push('缺少 WebCodecs 音频支持：可输入文字、选择手机朗读；设备支持 PCM 时可降级上行。模拟模式不阻塞。');
   $('compatibility').textContent = tips.join(' ');
   controls(); state('offline');
+  if (DEVICE) run(() => connect(false)); // 设备页:无需用户手势,直接建立 WS
 })();
