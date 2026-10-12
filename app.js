@@ -40,26 +40,29 @@
     const data = P.bytes(input), view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const tag = offset => String.fromCharCode(...data.subarray(offset, offset + 4));
     if (data.length < 12 || tag(0) !== 'RIFF' || tag(8) !== 'WAVE') throw new Error('TTS 没有返回 RIFF WAV，请确认 response_format=wav');
-    const end = view.getUint32(4, true) + 8;
-    if (end > data.length) throw new Error('WAV 数据被截断');
+    // 容错:许多 TTS 服务返回"流式 WAV"(RIFF/chunk 长度是 0 或占位值),
+    // 一律按实际收到的字节数取用,不因此判定截断。
+    let end = view.getUint32(4, true) + 8;
+    if (end <= 12 || end > data.length) end = data.length;
     let format, audio;
     for (let offset = 12; offset + 8 <= end;) {
       const size = view.getUint32(offset + 4, true), begin = offset + 8;
-      if (begin + size > end) throw new Error('WAV chunk 被截断');
+      const avail = end - begin;
+      const useSize = (size === 0 || size > avail) ? avail : size; // 占位/超长 → 用到结尾
       if (tag(offset) === 'fmt ') {
-        if (size < 16) throw new Error('WAV fmt 过短');
+        if (useSize < 16) throw new Error('WAV fmt 过短');
         format = { codec: view.getUint16(begin, true), channels: view.getUint16(begin + 2, true), rate: view.getUint32(begin + 4, true), align: view.getUint16(begin + 12, true), bits: view.getUint16(begin + 14, true) };
-        if (format.codec === 65534 && size >= 40) format.codec = view.getUint16(begin + 24, true);
+        if (format.codec === 65534 && useSize >= 40) format.codec = view.getUint16(begin + 24, true);
       }
-      if (tag(offset) === 'data') audio = { begin, size };
-      offset = begin + size + (size & 1);
+      if (tag(offset) === 'data') audio = { begin, size: useSize };
+      offset = begin + useSize + (useSize & 1);
     }
     if (!format || !audio) throw new Error('WAV 缺少 fmt 或 data');
     const { codec, channels, rate, bits, align } = format;
     if (!channels || channels > 8 || rate < 8000 || rate > 192000 || align !== channels * bits / 8 ||
         !((codec === 1 && [8, 16, 24, 32].includes(bits)) || (codec === 3 && bits === 32))) throw new Error('不支持此 WAV 编码（支持 PCM / float32）');
-    if (audio.size % align) throw new Error('WAV 样本不完整');
-    const count = audio.size / align;
+    // 尾部半样本直接裁掉(流式截断常见),而不是报错。
+    const count = Math.floor(audio.size / align);
     if (count / rate > 180) throw new Error('TTS 音频超过 180 秒，请缩短回复');
     const mono = new Float32Array(count);
     for (let i = 0; i < count; i++) {
@@ -704,7 +707,9 @@
   $('connect').addEventListener('click', () => run(() => connect(false)));
   $('reconnect').addEventListener('click', () => run(() => connect(true)));
   $('disconnect').addEventListener('click', () => link?.disconnect());
-  $('pair-form').addEventListener('submit', event => {
+  // 直连模式后配对码表单已隐藏(保留 DOM 兼容);守卫空引用,老配置也不崩。
+  const pairForm = $('pair-form');
+  if (pairForm) pairForm.addEventListener('submit', event => {
     event.preventDefault(); const code = $('pair-code').value;
     if (!/^[0-9]{6}$/.test(code)) { notice('请输入设备屏幕上的 6 位数字。', 'error'); return; }
     if (SIM && code !== '123456') { notice('模拟设备码为 123456。', 'error'); return; }
