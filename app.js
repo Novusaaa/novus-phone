@@ -3,6 +3,9 @@
   'use strict';
   const P = typeof NovProtocol !== 'undefined' ? NovProtocol : require('./protocol.js');
   const RATE = 16000, FRAME_SAMPLES = 960, FRAME_MS = 60;
+  // CosyVoice2 预置音色(硅基流动):官方要求 voice 带模型前缀;也支持"音色复刻"返回的 uri。
+  const TTS_VOICE_PREFIX = 'FunAudioLLM/CosyVoice2-0.5B:';
+  const TTS_VOICES = [['alex', '沉稳男声'], ['benjamin', '低沉男声'], ['charles', '磁性男声'], ['david', '欢快男声'], ['anna', '沉稳女声'], ['bella', '激情女声'], ['claire', '温柔女声'], ['diana', '欢快女声']];
   const DEFAULT_CONFIG = { vol: 80, bright: 100, mic_db: 30, screen_to: 60, speak: true, anim: true };
   const DEFAULT_PROVIDERS = {
     asr: { base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', key: '' },
@@ -759,12 +762,33 @@
       const heading = document.createElement('h3'); heading.textContent = title; block.append(heading);
       for (const [field, label] of [['base', '兼容端点 Base URL'], ['model', '模型'], ['key', 'API Key'], ...(kind === 'tts' ? [['voice', '音色 Voice']] : [])]) {
         const wrap = document.createElement('label'); wrap.textContent = label;
+        if (kind === 'tts' && field === 'voice') {
+          // 下拉切换预置音色;选"自定义"时露出输入框填复刻音色 uri。
+          const sel = document.createElement('select'); sel.id = 'tts-voice';
+          for (const [id, desc] of TTS_VOICES) {
+            const opt = document.createElement('option');
+            opt.value = TTS_VOICE_PREFIX + id;
+            opt.textContent = `${desc} · ${id}`;
+            sel.append(opt);
+          }
+          const custom = document.createElement('option');
+          custom.value = '__custom__'; custom.textContent = '自定义 / 复刻音色 uri…';
+          sel.append(custom);
+          const customInput = document.createElement('input');
+          customInput.id = 'tts-voice-custom'; customInput.type = 'text';
+          customInput.placeholder = '粘贴音色复刻返回的 uri(或其它音色名)';
+          customInput.autocomplete = 'off';
+          const cur = providers.tts.voice || '';
+          const known = TTS_VOICES.map(([id]) => TTS_VOICE_PREFIX + id);
+          if (known.includes(cur)) { sel.value = cur; customInput.hidden = true; }
+          else if (cur) { sel.value = '__custom__'; customInput.value = cur; customInput.hidden = false; }
+          else { sel.value = known[0]; customInput.hidden = true; }
+          sel.addEventListener('change', () => { customInput.hidden = sel.value !== '__custom__'; });
+          wrap.append(sel, customInput); block.append(wrap);
+          continue;
+        }
         const input = document.createElement('input'); input.id = kind + '-' + field; input.type = field === 'key' ? 'password' : field === 'base' ? 'url' : 'text';
         input.value = providers[kind][field]; input.autocomplete = 'off'; input.spellcheck = false; input.maxLength = field === 'key' ? 2000 : 500;
-        if (kind === 'tts' && field === 'voice') {
-          // 预置 8 音色(官方要求带模型前缀);也支持硅基流动"音色复刻"返回的 uri。
-          input.placeholder = '预置: alex 沉稳男 / benjamin 低沉男 / charles 磁性男 / david 欢快男 / anna 沉稳女 / bella 激情女 / claire 温柔女 / diana 欢快女';
-        }
         if (field !== 'key') input.required = true;
         wrap.append(input); block.append(wrap);
       }
@@ -785,11 +809,19 @@
     if (job) { notice('请在当前对话结束后修改服务设置。', 'error'); return; }
     run(() => {
       const next = structuredClone(providers);
-      for (const kind of Object.keys(next)) for (const field of Object.keys(next[kind])) next[kind][field] = $(kind + '-' + field).value.trim();
+      for (const kind of Object.keys(next)) for (const field of Object.keys(next[kind])) {
+        if (kind === 'tts' && field === 'voice') {
+          const sel = $('tts-voice');
+          next[kind][field] = sel.value === '__custom__' ? $('tts-voice-custom').value.trim() : sel.value;
+        } else {
+          next[kind][field] = $(kind + '-' + field).value.trim();
+        }
+      }
       for (const kind of Object.keys(next)) {
         const url = new URL(next[kind].base);
         if (url.username || url.password || url.search || url.hash || !next[kind].model || (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) throw new Error('请填写有效的 HTTPS Base URL 与模型（本机 localhost 可用 HTTP）');
       }
+      if (!next.tts.voice) throw new Error('请选择一个 TTS 音色（或填写复刻音色 uri）');
       // 写入失败时不显示保存成功，运行时配置仍可用。
       providers = next;
       localStorage.setItem(STORAGE, JSON.stringify({ ...next, system: $('system-prompt').value, phoneSpeech: $('phone-speech').checked }));
