@@ -7,7 +7,7 @@
   const DEFAULT_PROVIDERS = {
     asr: { base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', key: '' },
     llm: { base: 'https://api.deepseek.com', model: 'deepseek-chat', key: '' },
-    tts: { base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/CosyVoice2-0.5B', key: '', voice: 'alex' }
+    tts: { base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/CosyVoice2-0.5B', key: '', voice: 'FunAudioLLM/CosyVoice2-0.5B:alex' }
   };
   function abortError() { return new DOMException('已取消', 'AbortError'); }
   function check(signal) { if (signal && signal.aborted) throw abortError(); }
@@ -761,6 +761,10 @@
         const wrap = document.createElement('label'); wrap.textContent = label;
         const input = document.createElement('input'); input.id = kind + '-' + field; input.type = field === 'key' ? 'password' : field === 'base' ? 'url' : 'text';
         input.value = providers[kind][field]; input.autocomplete = 'off'; input.spellcheck = false; input.maxLength = field === 'key' ? 2000 : 500;
+        if (kind === 'tts' && field === 'voice') {
+          // 预置 8 音色(官方要求带模型前缀);也支持硅基流动"音色复刻"返回的 uri。
+          input.placeholder = '预置: alex 沉稳男 / benjamin 低沉男 / charles 磁性男 / david 欢快男 / anna 沉稳女 / bella 激情女 / claire 温柔女 / diana 欢快女';
+        }
         if (field !== 'key') input.required = true;
         wrap.append(input); block.append(wrap);
       }
