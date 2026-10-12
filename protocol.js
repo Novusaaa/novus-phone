@@ -150,6 +150,68 @@
     if (!count || count * ms > 120) throw new Error('非法 Opus 包时长');
     return count * ms;
   }
+  // 增量解析 OpenAI 兼容 SSE；只缓存尚未断行的数据，坏行与心跳不影响后续内容。
+  class SSEParser {
+    constructor() { this.buffer = ''; this.done = false; this.finished = false; }
+    line(line) {
+      if (this.done || !line.replace(/^\uFEFF/, '').startsWith('data:')) return [];
+      const data = line.replace(/^\uFEFF/, '').slice(5).trim();
+      if (data === '[DONE]') { this.done = true; return []; }
+      let event;
+      try { event = JSON.parse(data); } catch { return []; }
+      if (event?.error) throw new Error('LLM 流式响应报告错误，请检查模型与服务额度。');
+      const choice = event?.choices?.[0];
+      if (choice?.finish_reason != null) this.finished = true;
+      const content = choice?.delta?.content;
+      return typeof content === 'string' && content ? [content] : [];
+    }
+    push(chunk) {
+      if (this.done || !chunk) return [];
+      this.buffer += chunk;
+      const deltas = [];
+      while (!this.done) {
+        const end = this.buffer.search(/[\r\n]/);
+        if (end < 0 || (this.buffer[end] === '\r' && end === this.buffer.length - 1)) break;
+        const width = this.buffer[end] === '\r' && this.buffer[end + 1] === '\n' ? 2 : 1;
+        const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + width);
+        deltas.push(...this.line(line));
+      }
+      if (this.done) this.buffer = '';
+      return deltas;
+    }
+    flush() {
+      const line = this.buffer; this.buffer = '';
+      return this.done ? [] : this.line(line.trimEnd());
+    }
+  }
+  // 按 Unicode 字符计数，避免长度保险切开 emoji；每次只返回已完整的句子。
+  class SentenceSplitter {
+    constructor(maxLength = 120) {
+      if (!Number.isInteger(maxLength) || maxLength < 1) throw new RangeError('非法分句长度');
+      this.maxLength = maxLength; this.buffer = '';
+    }
+    push(delta) {
+      this.buffer += delta || '';
+      const sentences = [], chars = Array.from(this.buffer);
+      let start = 0;
+      for (let i = 0; i < chars.length; i++) {
+        const boundary = /[。！？；….!?;\r\n]/.test(chars[i]);
+        if (!boundary && i - start + 1 < this.maxLength) continue;
+        // 同一批中的连续句末符号及引号一并发送，不生成独立的标点语音。
+        if (boundary) while (i + 1 < chars.length && i - start + 1 < this.maxLength && /[。！？；….!?;\r\n”’"')）】]/.test(chars[i + 1])) i++;
+        const sentence = chars.slice(start, i + 1).join('').trim();
+        if (sentence) sentences.push(sentence);
+        start = i + 1;
+      }
+      this.buffer = chars.slice(start).join('');
+      return sentences;
+    }
+    flush() {
+      const tail = this.buffer.trim(); this.buffer = '';
+      return tail ? [tail] : [];
+    }
+  }
   return { TYPE, FLAG, LIMIT, bytes, concat, encodeFrame, fragment, FrameParser, MessageAssembler,
-    jsonPayload, parseJSON, control, configPatch, textPayload, parseText, textFrames, ttsFrame, opusDuration };
+    jsonPayload, parseJSON, control, configPatch, textPayload, parseText, textFrames, ttsFrame, opusDuration,
+    SSEParser, SentenceSplitter };
 });
