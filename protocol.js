@@ -11,6 +11,36 @@
   const encoder = new TextEncoder();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   const validFlags = new Set([0, 1, 3, 4, 6]);
+  const REPLY_CHAR_LIMIT = 2000;
+  // 按 Unicode 字符截断，省略号计入上限；截断后不留下行尾空白。
+  function limitReply(text) {
+    const chars = Array.from(text);
+    return chars.length > REPLY_CHAR_LIMIT ? chars.slice(0, REPLY_CHAR_LIMIT - 1).join('').trimEnd() + '…' : text;
+  }
+  function cleanForDevice(text) {
+    let cleaned = String(text ?? '').replace(/\r\n?/g, '\n'), previous;
+    // 清除连接符、肤色、旗帜与键帽修饰，保留普通数字；重复处理暴露出的嵌套标记。
+    do {
+      previous = cleaned;
+      cleaned = cleaned
+        .replace(/```[\s\S]*?(?:```|$)/g, '')
+        .replace(/!?\[([^\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))*)\)/g, (match, label) => match.startsWith('!') ? '' : label)
+        .replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\u200D\uFE0E\uFE0F\u20E3\u{E0020}-\u{E007F}]/gu, '')
+        .replace(/^[ \t]+|[ \t]+$/gm, '')
+        .replace(/^(?:#{1,6}(?:[ \t]+|$)|>[ \t]*|[-*+](?:[ \t]+|$)|\d+\.(?:[ \t]+|$))+/gm, '')
+        .replace(/[*_`]|~~/g, '')
+        .replace(/^[ \t]+|[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    } while (cleaned !== previous);
+    return limitReply(cleaned);
+  }
+  function cleanForSpeech(text) {
+    // 换行形成短停顿，已有句末标点则沿用；百分号、破折号与省略号保持原样。
+    return limitReply(cleanForDevice(text)
+      .replace(/([。！？；，、：.!?;,:…])\n+/g, '$1')
+      .replace(/\n+/g, '，'));
+  }
   function bytes(value) {
     if (value instanceof Uint8Array) return value;
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
@@ -211,7 +241,67 @@
       return tail ? [tail] : [];
     }
   }
+  // 流式回复先保留完整 Markdown 片段，避免分句把代码正文、图片地址或链接网址泄漏出去。
+  class ReplySplitter {
+    constructor(maxLength = 120) {
+      if (!Number.isInteger(maxLength) || maxLength < 1) throw new RangeError('非法分句长度');
+      this.maxLength = maxLength; this.buffer = '';
+    }
+    push(delta) {
+      this.buffer += delta || '';
+      const sentences = [];
+      let start = 0, count = 0;
+      for (let i = 0; i < this.buffer.length;) {
+        const begin = i, char = String.fromCodePoint(this.buffer.codePointAt(i));
+        // 单独到达的叹号可能是下一块图片的开头，不能当作句末先发出去。
+        if (char === '!' && i + 1 === this.buffer.length) break;
+        if (char === '`') {
+          const ticks = this.buffer.slice(i).match(/^`+/)[0];
+          const end = this.buffer.indexOf(ticks, i + ticks.length);
+          if (end < 0) break;
+          i = end + ticks.length;
+        } else if (char === '[' || (char === '!' && this.buffer[i + 1] === '[')) {
+          const labelEnd = this.buffer.indexOf(']', i + 1);
+          if (labelEnd < 0 || labelEnd + 1 === this.buffer.length) break;
+          i = labelEnd + 1;
+          if (this.buffer[i] === '(') {
+            let depth = 1; i++;
+            while (i < this.buffer.length && depth) {
+              if (this.buffer[i] === '(') depth++;
+              else if (this.buffer[i] === ')') depth--;
+              i++;
+            }
+            if (depth) break;
+          }
+        } else {
+          // 有序列表的点不是句末；若下一字符未到，等待它来确认标记。
+          if (char === '.' && /(?:^|\n)[ \t]*(?:>[ \t]*)*\d+$/.test(this.buffer.slice(start, i))) {
+            if (i + 1 === this.buffer.length) break;
+            // 此处既可能是列表标记，也可能是行首小数或版本号，都不单独切出“1.”。
+            i++; count++; continue;
+          }
+          i += char.length;
+        }
+        count += Array.from(this.buffer.slice(begin, i)).length;
+        const boundary = /[。！？；….!?;\r\n]/.test(char);
+        if (!boundary && count < this.maxLength) continue;
+        if (boundary) while (i < this.buffer.length && /[。！？；….!?;\r\n”’"')）】]/.test(this.buffer[i])) {
+          if (this.buffer[i] === '!' && (i + 1 === this.buffer.length || this.buffer[i + 1] === '[')) break;
+          i++;
+        }
+        const sentence = this.buffer.slice(start, i);
+        if (sentence.trim()) sentences.push(sentence);
+        start = i; count = 0;
+      }
+      this.buffer = this.buffer.slice(start);
+      return sentences;
+    }
+    flush() {
+      const tail = this.buffer; this.buffer = '';
+      return tail.trim() ? [tail] : [];
+    }
+  }
   return { TYPE, FLAG, LIMIT, bytes, concat, encodeFrame, fragment, FrameParser, MessageAssembler,
     jsonPayload, parseJSON, control, configPatch, textPayload, parseText, textFrames, ttsFrame, opusDuration,
-    SSEParser, SentenceSplitter };
+    SSEParser, SentenceSplitter, ReplySplitter, REPLY_CHAR_LIMIT, cleanForDevice, cleanForSpeech };
 });
