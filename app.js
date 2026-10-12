@@ -96,8 +96,30 @@
     for (let i = 0; i < data.length; i++) data[i] = Math.sin(2 * Math.PI * 440 * i / RATE) * 0.12 * Math.min(1, i / 160, (data.length - i) / 160);
     return data;
   }
+  async function readLLMStream(response, signal, emit) {
+    check(signal);
+    if (!/^text\/event-stream\b/i.test(response.headers.get('Content-Type') || '') || !response.body?.getReader) {
+      await response.body?.cancel().catch(() => {});
+      const error = new Error('LLM 不支持 SSE'); error.streamUnsupported = true; throw error;
+    }
+    const reader = response.body.getReader(), decoder = new TextDecoder(), sse = new P.SSEParser();
+    const stop = () => { reader.cancel().catch(() => {}); };
+    check(signal); signal?.addEventListener('abort', stop, { once: true });
+    try {
+      while (!sse.done) {
+        const { value, done } = await reader.read(); check(signal);
+        for (const delta of sse.push(decoder.decode(value, { stream: !done }))) emit(delta);
+        if (done) { for (const delta of sse.flush()) emit(delta); break; }
+      }
+      // 缺少任何正常结束标记的 EOF 是中断，不能把半截回答当作成功。
+      if (!sse.done && !sse.finished) throw new Error('LLM 流式响应中断，请重试。');
+    } finally {
+      signal?.removeEventListener('abort', stop);
+      await reader.cancel().catch(() => {}); reader.releaseLock();
+    }
+  }
   // Node 可直接验证音频封装，不初始化 UI。
-  if (typeof module === 'object' && module.exports) module.exports = { wavEncode, wavDecode, resampleLinear, syntheticTone };
+  if (typeof module === 'object' && module.exports) module.exports = { wavEncode, wavDecode, resampleLinear, syntheticTone, readLLMStream };
   if (typeof document === 'undefined') return;
 
   const $ = id => document.getElementById(id);
@@ -139,18 +161,20 @@
     const body = document.createElement('p'); body.textContent = text; article.append(label, body); $('history').append(article);
     while ($('history').children.length > 100) $('history').firstElementChild.remove();
     $('history').scrollTop = $('history').scrollHeight;
+    return body;
   }
   function current(task) { check(task.controller.signal); if (job !== task) throw abortError(); }
   function newJob(kind) {
-    cancelLocal();
+    // 设备确认录音时延续网页按住状态，否则松开/模拟注入无法发送 turn_end。
+    cancelLocal(kind === 'voice' && holding);
     const task = { id: ++jobId, kind, controller: new AbortController(), audio: [], samples: 0, lastSeq: null, lost: 0, codec: null, started: performance.now(), ended: false };
     job = task; return task;
   }
   function releaseHold() {
     holding = false; $('talk').classList.remove('holding'); $('talk-label').textContent = '按住说话';
   }
-  function cancelLocal() {
-    clearTimeout(eventStartTimer); clearTimeout(eventEndTimer); releaseHold();
+  function cancelLocal(keepHold = false) {
+    clearTimeout(eventStartTimer); clearTimeout(eventEndTimer); if (!keepHold) releaseHold();
     if (job) { job.controller.abort(); job = null; }
     if ('speechSynthesis' in window) speechSynthesis.cancel();
     state(online ? 'ready' : 'offline');
@@ -510,7 +534,7 @@
       await ask(text.trim(), task);
     } catch (error) { await failJob(task, error); }
   }
-  async function fetchProvider(kind, path, options, signal) {
+  async function fetchProvider(kind, path, options, signal, consume) {
     const provider = providers[kind];
     if (!provider.key.trim()) throw new Error(`请先填写并保存 ${kind.toUpperCase()} API Key`);
     const base = provider.base.trim().replace(/\/+$/, '');
@@ -523,8 +547,13 @@
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 90000);
     try {
       const response = await fetch(url.href, { ...options, headers: { Authorization: 'Bearer ' + provider.key.trim(), ...options.headers }, signal: controller.signal });
-      if (!response.ok) throw new Error(`${kind.toUpperCase()} HTTP ${response.status}，请检查密钥、模型和服务额度。`);
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        const error = new Error(`${kind.toUpperCase()} HTTP ${response.status}，请检查密钥、模型和服务额度。`);
+        error.streamUnsupported = !!consume; throw error;
+      }
       // 响应体也受超时与取消约束；不把 provider 原始错误体输出到页面。
+      if (consume) return await consume(response, controller.signal);
       return path === '/audio/speech' ? await response.arrayBuffer() : await response.json();
     } catch (error) {
       if (timedOut) throw new Error(kind.toUpperCase() + ' 请求超过 90 秒，请重试');
@@ -540,8 +569,7 @@
     if (typeof result.text !== 'string') throw new Error('ASR 响应缺少 text 字段');
     return result.text;
   }
-  async function llm(text, signal) {
-    if (SIM && $('sim-providers').checked) { await sleep(350, signal); return '你好，我是 novus。你可以按住说话，也可以直接打字。手机帮我连接 AI，我把回应带回你身边。'; }
+  async function llm(text, signal, onDelta) {
     const messages = [];
     const system = $('system-prompt').value.trim(); if (system) messages.push({ role: 'system', content: system });
     let budget = 16000;
@@ -552,27 +580,78 @@
       if (size > budget) break; recent.unshift(...pair); budget -= size;
     }
     messages.push(...recent, { role: 'user', content: text });
-    const result = await fetchProvider('llm', '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.llm.model, messages, stream: false, max_tokens: 1024 }) }, signal);
-    const answer = result.choices?.[0]?.message?.content;
-    if (typeof answer !== 'string' || !answer.trim()) throw new Error('LLM 响应没有有效的 choices[0].message.content');
+    let answer = '';
+    const emit = delta => { check(signal); answer += delta; onDelta(delta); };
+    const consume = (response, requestSignal) => readLLMStream(response, requestSignal, emit);
+    const request = async stream => {
+      if (SIM && $('sim-providers').checked) {
+        await sleep(350, signal);
+        const result = { choices: [{ message: { content: '你好，我是 novus。你可以按住说话，也可以直接打字。手机帮我连接 AI，我把回应带回你身边。' } }] };
+        // 假 provider 返回整段 JSON，实际经过同一条非 SSE 回退路径。
+        return stream ? consume(new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } }), signal) : result;
+      }
+      return fetchProvider('llm', '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: providers.llm.model, messages, stream, max_tokens: 1024 }) }, signal, stream ? consume : undefined);
+    };
+    try { await request(true); }
+    catch (error) {
+      // 仅在尚未开始 SSE 的 HTTP/格式拒绝时重试；中途失败绝不重播半截答案。
+      if (!error.streamUnsupported) throw error;
+      check(signal); diagnostic('LLM 不支持流式，已回退整段请求');
+      const result = await request(false), content = result.choices?.[0]?.message?.content;
+      if (typeof content !== 'string') throw new Error('LLM 响应没有有效的 choices[0].message.content');
+      emit(content);
+    }
+    if (!answer.trim()) throw new Error('LLM 响应没有有效的回答内容');
     return answer.trim();
   }
   async function ask(text, task = newJob('text')) {
+    const signal = task.controller.signal, splitter = new P.SentenceSplitter();
+    const phone = $('phone-speech').checked || config?.speak === false || !online;
+    let speechTail = Promise.resolve(), speechError = null, body = null, shown = '';
+    // 所有后台 Promise 都立即挂拒绝处理；语音/写入失败同时取消 LLM 与其余句子。
+    const monitor = promise => {
+      promise.catch(error => { if (!speechError) speechError = error; task.controller.abort(); });
+      return promise;
+    };
+    const enqueue = sentence => {
+      current(task);
+      const displayed = monitor(sendText('A', sentence, signal));
+      let prepared;
+      if (!phone) {
+        if (!task.ttsStarted) {
+          task.ttsSeq = 0; task.ttsFrames = 0; task.playing = true; state('speaking');
+          task.ttsStarted = monitor(sendControl('tts_start', {}, signal));
+        }
+        // 合成与 LLM 读取并行；每句立即请求 TTS，发送仍按句子顺序串行。
+        prepared = monitor(prepareDeviceSpeech(sentence, task));
+      }
+      speechTail = monitor(speechTail.then(async () => {
+        await displayed; current(task);
+        if (phone) await phoneSpeak(sentence, task);
+        else { await task.ttsStarted; await deviceSpeak(await prepared, task); }
+      }));
+    };
     try {
-      current(task); addMessage('U', text); await sendText('U', text, task.controller.signal); await gateway('working', task.controller.signal);
-      const answer = await llm(text, task.controller.signal); current(task);
-      addMessage('A', answer); history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
+      current(task); addMessage('U', text); await sendText('U', text, signal); await gateway('working', signal);
+      const answer = await llm(text, signal, delta => {
+        current(task); shown += delta;
+        if (!body) body = addMessage('A', shown); else body.textContent = shown;
+        $('history').scrollTop = $('history').scrollHeight;
+        for (const sentence of splitter.push(delta)) enqueue(sentence);
+      });
+      current(task); for (const sentence of splitter.flush()) enqueue(sentence);
+      history.push({ role: 'user', content: text }, { role: 'assistant', content: answer });
       if (history.length > 40) history.splice(0, history.length - 40);
-      await sendText('A', answer, task.controller.signal);
-      if ($('phone-speech').checked || config?.speak === false || !online) await phoneSpeak(answer, task);
-      else await deviceSpeak(answer, task);
+      await speechTail; current(task);
+      if (task.ttsStarted) await finishDeviceSpeech(task);
       current(task); job = null; await gateway('ready'); notice('这一轮已完成。', 'success');
-    } catch (error) { await failJob(task, error); }
+    } catch (error) { await failJob(task, speechError || error); }
   }
   async function failJob(task, error) {
     if (job !== task) return;
     const cancelled = error?.name === 'AbortError';
     task.controller.abort(); job = null; releaseHold();
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
     if (!cancelled) { addMessage('S', error.message); fail(error); }
     if (online) {
       try { await sendControl('turn_cancel'); await sendControl('tts_abort'); await sendText('S', cancelled ? '对话已取消' : '网关失败，请查看手机'); await gateway('ready'); } catch (ignored) { diagnostic('错误恢复期间链路不可用'); }
@@ -615,7 +694,7 @@
       return packets;
     } finally { signal.removeEventListener('abort', stop); stop(); }
   }
-  async function deviceSpeak(text, task) {
+  async function prepareDeviceSpeech(text, task) {
     const signal = task.controller.signal;
     let wav;
     if (SIM && $('sim-providers').checked) wav = wavEncode(syntheticTone(1));
@@ -635,16 +714,22 @@
         diagnostic('模拟 TTS 编码降级：' + error.message);
       }
     }
-    current(task); task.playing = true; state('speaking');
-    const played = awaitEvent(e => e.ev === 'tts_playback_done', packets.length * 60 + 30000, signal);
+    current(task); return packets;
+  }
+  async function deviceSpeak(packets, task) {
+    const signal = task.controller.signal;
+    // 整轮只预缓冲三包，后续句子延续同一 SEQ；逐 ATT chunk await 保留链路背压。
+    for (const packet of packets) {
+      current(task); const started = performance.now();
+      await sendFrames([P.ttsFrame(task.ttsSeq++ & 255, packet)], signal);
+      if (++task.ttsFrames >= 3) await sleep(Math.max(0, FRAME_MS - (performance.now() - started)), signal);
+    }
+  }
+  async function finishDeviceSpeech(task) {
+    const signal = task.controller.signal;
+    // LLM 与句子队列都已结束才等播放确认，避免把生成时间算入确认超时。
+    const played = awaitEvent(e => e.ev === 'tts_playback_done', task.ttsFrames * FRAME_MS + 30000, signal);
     try {
-      await sendControl('tts_start', {}, signal);
-      // 预缓冲三包后按帧时长节流；慢链路不追赶、不突发补发。
-      for (let i = 0; i < packets.length; i++) {
-        current(task); const started = performance.now();
-        await sendFrames([P.ttsFrame(i & 255, packets[i])], signal);
-        if (i >= 2) await sleep(Math.max(0, FRAME_MS - (performance.now() - started)), signal);
-      }
       await sendControl('tts_stop', {}, signal);
       const event = await played.promise; current(task);
       diagnostic(`TTS 播完 ${Number(event.decoded || event.frames || 0)} 帧，丢弃 ${Number(event.dropped || 0)}，欠载 ${Number(event.underruns || 0)}`);
