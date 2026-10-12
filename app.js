@@ -664,7 +664,16 @@
       }
       speechTail = monitor(speechTail.then(async () => {
         await displayed; current(task);
-        if (phone) await phoneSpeak(sentence, task);
+        if (phone) {
+          task.playing = true;
+          // 让设备同步"说话"形象动画(尽力而为,失败不影响朗读)。
+          if (online && !task.speakStateSent) {
+            task.speakStateSent = true;
+            sendControl('speak_state', { on: true }, signal)
+              .catch(() => diagnostic('speak_state(on) 未送达，不影响朗读'));
+          }
+          await phoneSpeak(sentence, task);
+        }
         else { await task.ttsStarted; await deviceSpeak(await prepared, task); }
       }));
     };
@@ -681,6 +690,10 @@
       if (history.length > 40) history.splice(0, history.length - 40);
       if (!P.cleanForDevice(answer)) await sendText('S', '（回复为代码或图片，请在手机查看）', signal);
       await speechTail; current(task);
+      if (phone && task.speakStateSent) {
+        await sendControl('speak_state', { on: false }, signal)
+          .catch(() => diagnostic('speak_state(off) 未送达，不影响朗读'));
+      }
       if (task.ttsStarted) await finishDeviceSpeech(task);
       current(task); job = null; await gateway('ready'); notice('这一轮已完成。', 'success');
     } catch (error) { await failJob(task, speechError || error); }
