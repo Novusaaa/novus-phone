@@ -49,7 +49,8 @@ in `localStorage` on the phone and are never sent to the device.
 
 If you would rather not use cloud TTS at all, uncheck the device-side speech
 (the "phone speech" switch) — the phone then reads replies aloud with its
-built-in `speechSynthesis` and nothing is downloaded.
+built-in `speechSynthesis` and nothing is downloaded. The device still shows
+the reply text and mirrors the speaking animation (`speak_state` control).
 
 ## Protocol tests
 
