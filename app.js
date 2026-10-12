@@ -244,13 +244,30 @@
       device.addEventListener('gattserverdisconnected', this.onDisconnect);
     }
     async connect() {
-      const server = await this.device.gatt.connect(); this.connected = true;
-      const service = await server.getPrimaryService(SERVICE);
-      this.rx = await service.getCharacteristic(RX); this.tx = await service.getCharacteristic(TX);
-      this.tx.removeEventListener('characteristicvaluechanged', this.onValue);
-      this.tx.addEventListener('characteristicvaluechanged', this.onValue);
-      // 此加密 CCCD 访问会触发系统配对；网页没有 passkey API。
-      await this.tx.startNotifications();
+      let lastError = null;
+      // 设备重启/换固件后，系统缓存的 GATT 句柄可能已失效（"GATT Server is disconnected"）。
+      // 先断开旧句柄，整个「连接→取服务→订阅」流程重试一次。
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const server = await this.device.gatt.connect(); this.connected = true;
+          const service = await server.getPrimaryService(SERVICE);
+          this.rx = await service.getCharacteristic(RX); this.tx = await service.getCharacteristic(TX);
+          this.tx.removeEventListener('characteristicvaluechanged', this.onValue);
+          this.tx.addEventListener('characteristicvaluechanged', this.onValue);
+          await this.tx.startNotifications();
+          return;
+        } catch (error) {
+          lastError = error;
+          this.connected = false; this.rx = null; this.tx = null;
+          try { this.device.gatt.disconnect(); } catch { /* 已断开则忽略 */ }
+          if (attempt === 1) await new Promise(resolve => setTimeout(resolve, 600));
+        }
+      }
+      if (lastError instanceof DOMException && ['NotFoundError', 'NetworkError'].includes(lastError.name)) {
+        const error = new Error('连接句柄已失效（设备刚重启或重新刷写后常见）。请点「扫描并连接」重新选择设备；仍失败则先关闭再打开手机蓝牙。');
+        error.cause = lastError; throw error;
+      }
+      throw lastError;
     }
     async write(chunk) {
       if (!this.connected || !this.rx) throw new Error('蓝牙不可写，请重新连接。');
@@ -374,7 +391,12 @@
       notice('设备已就绪。可以读取配置，或进入对话。', 'success');
       await readConfig();
     } catch (error) {
-      online = false; link?.disconnect();
+      online = false;
+      // 重连失败说明旧句柄已不可信：清掉，改用「扫描并连接」走全新会话。
+      if (reuse && link) {
+        try { link.device.gatt.disconnect(); } catch { /* 非 BLE 或已断开 */ }
+        link.dispose(); link = null;
+      } else link?.disconnect();
       throw error;
     } finally { connecting = false; controls(); if (!online) state('offline'); }
   }
