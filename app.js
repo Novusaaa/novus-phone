@@ -710,10 +710,6 @@
       const displayed = monitor(sendText('A', sentence, signal));
       let prepared;
       if (!phone) {
-        if (!task.ttsStarted) {
-          task.ttsSeq = 0; task.ttsFrames = 0; task.playing = true; state('speaking');
-          task.ttsStarted = monitor(sendControl('tts_start', { pcm: PCM_TTS }, signal));
-        }
         // 合成与 LLM 读取并行；每句立即请求 TTS，发送仍按句子顺序串行。
         prepared = monitor(prepareDeviceSpeech(sentence, task));
       }
@@ -729,7 +725,17 @@
           }
           await phoneSpeak(sentence, task);
         }
-        else { await task.ttsStarted; await deviceSpeak(await prepared, task); }
+        else {
+          const packets = await prepared;
+          // tts_start 推迟到首句音频就绪后再发:设备不会摆着"说话"姿势干等合成,
+          // 也不会触发设备的首包等待超时(真机实测 TTS 首包 ~1.6s)。
+          if (!task.ttsStarted) {
+            task.ttsSeq = 0; task.ttsFrames = 0; task.playing = true; state('speaking');
+            task.ttsStarted = monitor(sendControl('tts_start', { pcm: PCM_TTS }, signal));
+          }
+          await task.ttsStarted;
+          await deviceSpeak(packets, task);
+        }
       }));
     };
     try {
@@ -840,14 +846,45 @@
     // 整轮预缓冲再转入实时节奏:BLE 抖动大(16 包≈1s);WiFi 链路帧更短,32 帧≈0.5s 足够。
     // 设备队列容量 24,预缓冲留有数包余量。后续句子延续同一 SEQ。
     const frameMs = PCM_TTS ? PCM_FRAME_MS : FRAME_MS;
-    const PREBUFFER_FRAMES = PCM_TTS ? 32 : 16;
+    // 预缓冲:PCM 12 帧(≈190ms,设备队列 24 容纳得下,不再爆队列丢包);
+    // BLE 仍 16 帧(≈1s,抖动大)。
+    const PREBUFFER_FRAMES = PCM_TTS ? 12 : 16;
+    // 节拍按"目标时刻"推进(而不是每帧固定 sleep):慢帧之后自动追平,
+    // 否则定时器漂移会让平均速率低于设备播放速率,缓冲慢慢饿空(真机欠载)。
+    const started = performance.now();
+    // PCM:每 4 帧(64ms/≈2KB)打包成一条 WebSocket 消息。逐帧一消息会被
+    // TCP 小包+延迟确认拖到 ~30 帧/秒(真机实测),设备播放饿等上千次。
+    // 合并成"一条消息"发送(不是逐帧发):逐帧调用 sendFrames 的固定开销
+    // (DOM 读取 + Promise 链)真机实测把速率压到 ~42 帧/秒,低于设备 62.5 帧/秒
+    // 的消耗 → 缓冲必然饿空。4 帧 ≈ 2076B,设备重组器(4KB)按序拆回。
+    const BATCH = PCM_TTS ? 4 : 1;
+    let pending = [], sent = 0; // sent=本次调用内的帧数:节拍起点按句重算,不能用累计值
+    const flush = async () => {
+      if (!pending.length) return;
+      await sendFrames([PCM_TTS && pending.length > 1 ? P.concat(pending) : pending[0]], signal);
+      task.ttsFrames += pending.length; sent += pending.length;
+      pending = [];
+    };
+    let lastAt = performance.now(); // 临时埋点:gap>200ms 时打印节拍分解
     for (const packet of packets) {
-      current(task); const started = performance.now();
-      const frame = PCM_TTS ? P.ttsPcmFrame(task.ttsSeq & 255, packet) : P.ttsFrame(task.ttsSeq & 255, packet);
+      current(task);
+      pending.push(PCM_TTS ? P.ttsPcmFrame(task.ttsSeq & 255, packet) : P.ttsFrame(task.ttsSeq & 255, packet));
       task.ttsSeq++;
-      await sendFrames([frame], signal);
-      if (++task.ttsFrames >= PREBUFFER_FRAMES) await sleep(Math.max(0, frameMs - (performance.now() - started)), signal);
+      if (pending.length >= BATCH) {
+        const t0 = performance.now();
+        await flush();
+        const t1 = performance.now();
+        let wait = 0;
+        if (sent >= PREBUFFER_FRAMES) {
+          wait = started + sent * frameMs - performance.now();
+          if (wait > 0) await sleep(wait, signal);
+        }
+        const gap = performance.now() - lastAt; lastAt = performance.now();
+        // 节拍异常只进诊断面板(>200ms 才记):定位"设备播放饿等"时看这里。
+        if (gap > 200) diagnostic(`发送节拍抖动 ${gap.toFixed(0)}ms(flush ${(t1 - t0).toFixed(1)}ms, wait ${wait.toFixed(0)}ms)`);
+      }
     }
+    await flush();
   }
   async function finishDeviceSpeech(task) {
     const signal = task.controller.signal;
